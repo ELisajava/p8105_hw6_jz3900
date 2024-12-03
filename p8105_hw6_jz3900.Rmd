@@ -7,19 +7,89 @@ output: github_document
 
 ## Load Necessary Libraries and Set Seed
 ```{r}
-options(repos = c(CRAN = "https://cloud.r-project.org/"))
-install.packages("broom")
-library(broom)
 library(tidyverse)
-library(p8105.datasets)
+library(broom)
 library(patchwork)
-library(forcats)
 library(modelr)
+library(forcats)
+library(janitor)
 library(mgcv)
 set.seed(1)
 theme_set(theme_minimal() + theme(legend.position = "bottom"))
 ```
 
+# Problem 1
+## Import the data
+```{r}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31")  |> 
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10)  |> 
+  select(name, id, everything())
+```
+
+## Bootstrap procedure with `modelr::bootstrap`.
+```{r}
+boot_results = weather_df  |> 
+  modelr::bootstrap(n = 5000)  |> 
+  mutate(
+    model = map(strap, \(df) lm(tmax ~ tmin, data = df)),  
+    glance_results = map(model, broom::glance),           
+    tidy_results = map(model, broom::tidy)                
+  )
+
+
+final_results = boot_results |> 
+  mutate(
+    r_squared = map_dbl(glance_results, "r.squared"),  
+    tidy_df = map(tidy_results, \(df) df |> 
+                    select(term, estimate) |>         
+                    pivot_wider(names_from = term, values_from = estimate) |> 
+                    mutate(log_beta = log(`(Intercept)`) + log(tmin))) 
+  ) |> 
+  select(-strap, -model, -glance_results, -tidy_results) |> 
+  unnest(tidy_df)  
+```
+
+## Draw the Distribution Plots for the estimates $\hat{r}^2$ and $log(\hat{\beta}_0 * \hat{\beta}_1)$.
+```{r}
+plot_1 = ggplot(final_results, aes(x = r_squared)) +
+  geom_density(fill = "blue", alpha = 0.5) +
+  labs(title = "Distribution of R_squared", x = "R^2", y = "Density") +
+  theme_minimal()
+
+plot_2 = ggplot(final_results, aes(x = log_beta)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  labs(title = "Distribution of log(β0 * β1)", x = "log(β0 * β1)", y = "Density") +
+  theme_minimal()
+
+plot_1 + plot_2
+```
+
+**Description**:
+
+Based on the plots, it is evident that both estimates approximate a normal distribution. The left-hand plot illustrates the distribution of \( \hat{r} ^2 \), which is primarily concentrated within the range of 0.88 to 0.94 and exhibits a symmetric, unimodal pattern. Similarly, the right-hand plot displays the distribution of \( \log(\hat{\beta}_0 \cdot \hat{\beta}_1) \), concentrated between 1.95 and 2.10, also showing a symmetric, unimodal shape. These patterns indicate that the estimates are precise and consistent.
+
+To determine the 95% confidence intervals for \( \hat{r}^2 \) and \( \log(\hat{\beta}_0 \cdot \hat{\beta}_1) \), use the 2.5th and 97.5th percentiles derived from the 5000 bootstrap samples.
+
+```{r}
+ci_results = final_results |> 
+  reframe(
+    r_squared_ci = quantile(r_squared, c(0.025, 0.975)),
+    log_beta_ci = quantile(log_beta, c(0.025, 0.975))
+  )
+
+cat("95% Confidence Interval for R^2:", ci_results$r_squared_ci, "\n")
+cat("95% Confidence Interval for log(beta0 * beta1):", ci_results$log_beta_ci, "\n")
+```
+95% confidence interval for r^2 is (0.894, 0.927).
+95% confidence interval for log (β0⋅β1) is (1.965, 2.059).
 
 # Problem 2 
 ## Import and organize data
@@ -114,3 +184,99 @@ Cities like Albuquerque, NM, and Stockton, CA, display notably wide confidence i
 
 4. **Statistical Significance:**  
 Cities where the confidence intervals do not include OR = 1 demonstrate statistically significant differences (e.g., New York). Conversely, cities with confidence intervals that overlap OR = 1 are not statistically significant, indicating no definitive evidence of a difference in resolution rates between male and female victims.  
+
+# Problem 3
+## Import and Organize the Data
+```{r}
+birthweight_data=read_csv(
+  "./data/birthweight.csv",
+  na = c("NA", ".", "")) |> 
+  janitor::clean_names() |> 
+  mutate(
+    babysex = factor(babysex, levels = c(1, 2), labels = c("Male", "Female")),
+    frace = factor(frace, levels = c(1, 2, 3, 4, 8, 9), labels = c("White", "Black", "Asian", "Puerto Rican", "Other", "Unknown")),
+    mrace = factor(mrace, levels = c(1, 2, 3, 4, 8), labels = c("White", "Black", "Asian", "Puerto Rican", "Other")),
+    malform = factor(malform, levels = c(0, 1), labels = c("Absent", "Present"))
+  ) |> 
+  drop_na()
+```
+
+## Proposed Linear Regression Model for Predicting Birthweight Using Key Predictors
+```{r}
+lm_model = lm(
+  bwt ~ delwt + gaweeks+ppbmi+momage+smoken, 
+  data = birthweight_data)
+
+summary(lm_model)
+```
+
+## Residuals vs. Fitted Values Analysis for Birthweight Model
+```{r}
+birthweight_lm = birthweight_data |> 
+  add_predictions(lm_model) |> 
+  add_residuals(lm_model)
+
+ggplot(birthweight_lm, aes(x = pred, y = resid)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Residuals vs Fitted Values", x = "Fitted values", y = "Residuals")
+```
+
+**Description**:
+
+The residuals vs. fitted values plot reveals the following:  
+1. **Non-linearity:** The curvature of the LOESS line indicates that the model does not fully capture the underlying relationship between the predictors and birth weight.  
+2. **Heteroscedasticity:** An increase in residual variance at lower fitted values suggests a violation of the assumption of constant variance.  
+3. **Outliers:** The presence of extreme residuals indicates potential influential points that may impact the model's performance.  
+## Monte Carlo Cross-Validation and RMSE Distribution for Birthweight Models
+```{r}
+cv_df = 
+  crossv_mc(birthweight_data, 100) |> 
+  mutate(
+    train = map(train, as_tibble), 
+    test = map(test, as_tibble)  
+  )
+
+cv_df = cv_df |> 
+  mutate(
+    lm_model = map(train, \(df) lm(bwt ~ delwt + gaweeks+ppbmi+momage+smoken, 
+                                   data = df)),
+    model_length_ga = map(train, \(df) lm(bwt ~ blength + gaweeks, data = df)),
+    model_interaction = map(train, \(df) lm(bwt ~ bhead * blength * babysex, data = df))
+  ) |> 
+  mutate(
+    rmse_lm_model = map2_dbl(lm_model, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_length_ga = map2_dbl(model_length_ga, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_interaction = map2_dbl(model_interaction, test, \(mod, df) rmse(model = mod, data = df))
+  )
+
+rmse_results = cv_df |> 
+  select(starts_with("rmse")) |> 
+  pivot_longer(
+    cols = everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_"
+  ) |> 
+  mutate(model = fct_inorder(model))
+
+rmse_results |> 
+  ggplot(aes(x = model, y = rmse)) + 
+  geom_violin(fill = "lightgreen", alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Cross-validated RMSE for Different Models",
+    x = "Model",
+    y = "RMSE"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  )
+```
+
+**Description**:
+
+The interaction model demonstrates superior performance, offering both higher accuracy (as evidenced by lower RMSE) and greater consistency (reflected in a narrower interquartile range).  
+The proposed model strikes a balance between model complexity and predictive performance, making it a well-rounded option.  
+
+In contrast, the main effects model performs the least effectively, characterized by higher RMSE and greater variability.  
