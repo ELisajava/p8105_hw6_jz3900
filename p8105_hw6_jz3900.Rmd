@@ -5,7 +5,88 @@ date: "2024-12-03"
 output: github_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+## Load Necessary Libraries and Set Seed
+```{r}
+library(tidyverse)
+library(p8105.datasets)
+library(patchwork)
+library(forcats)
+library(modelr)
+library(mgcv)
+set.seed(1)
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
 ```
+
+# Problem 1
+## Import the data
+```{r}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31")  |> 
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10)  |> 
+  select(name, id, everything())
+```
+
+## Bootstrap procedure with `modelr::bootstrap`.
+```{r}
+boot_results = weather_df  |> 
+  modelr::bootstrap(n = 5000)  |> 
+  mutate(
+    model = map(strap, \(df) lm(tmax ~ tmin, data = df)),  
+    glance_results = map(model, broom::glance),           
+    tidy_results = map(model, broom::tidy)                
+  )
+
+
+final_results = boot_results |> 
+  mutate(
+    r_squared = map_dbl(glance_results, "r.squared"),  
+    tidy_df = map(tidy_results, \(df) df |> 
+                    select(term, estimate) |>         
+                    pivot_wider(names_from = term, values_from = estimate) |> 
+                    mutate(log_beta = log(`(Intercept)`) + log(tmin))) 
+  ) |> 
+  select(-strap, -model, -glance_results, -tidy_results) |> 
+  unnest(tidy_df)  
+```
+
+## Draw the Distribution Plots for the estimates $\hat{r}^2$ and $log(\hat{\beta}_0 * \hat{\beta}_1)$.
+```{r}
+plot_1 = ggplot(final_results, aes(x = r_squared)) +
+  geom_density(fill = "blue", alpha = 0.5) +
+  labs(title = "Distribution of R_squared", x = "R^2", y = "Density") +
+  theme_minimal()
+
+plot_2 = ggplot(final_results, aes(x = log_beta)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  labs(title = "Distribution of log(β0 * β1)", x = "log(β0 * β1)", y = "Density") +
+  theme_minimal()
+
+plot_1 + plot_2
+```
+
+**Description**:
+
+Based on the plots, it is evident that both estimates approximate a normal distribution. The left-hand plot illustrates the distribution of \( \hat{r}^2 \), which is primarily concentrated within the range of 0.88 to 0.94 and exhibits a symmetric, unimodal pattern. Similarly, the right-hand plot displays the distribution of \( \log(\hat{\beta}_0 \cdot \hat{\beta}_1) \), concentrated between 1.95 and 2.10, also showing a symmetric, unimodal shape. These patterns indicate that the estimates are precise and consistent.
+
+To determine the 95% confidence intervals for \( \hat{r}^2 \) and \( \log(\hat{\beta}_0 \cdot \hat{\beta}_1) \), use the 2.5th and 97.5th percentiles derived from the 5000 bootstrap samples.
+
+```{r}
+ci_results = final_results |> 
+  reframe(
+    r_squared_ci = quantile(r_squared, c(0.025, 0.975)),
+    log_beta_ci = quantile(log_beta, c(0.025, 0.975))
+  )
+
+cat("95% Confidence Interval for R^2:", ci_results$r_squared_ci, "\n")
+cat("95% Confidence Interval for log(beta0 * beta1):", ci_results$log_beta_ci, "\n")
+```
+95% confidence interval for r^2 is (0.894, 0.927).
+95% confidence interval for log (β0⋅β1) is (1.965, 2.059).
 
