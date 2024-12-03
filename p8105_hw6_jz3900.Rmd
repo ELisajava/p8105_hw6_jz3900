@@ -7,6 +7,9 @@ output: github_document
 
 ## Load Necessary Libraries and Set Seed
 ```{r}
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+install.packages("broom")
+library(broom)
 library(tidyverse)
 library(p8105.datasets)
 library(patchwork)
@@ -17,76 +20,97 @@ set.seed(1)
 theme_set(theme_minimal() + theme(legend.position = "bottom"))
 ```
 
-# Problem 1
-## Import the data
+
+# Problem 2 
+## Import and organize data
 ```{r}
-weather_df = 
-  rnoaa::meteo_pull_monitors(
-    c("USW00094728"),
-    var = c("PRCP", "TMIN", "TMAX"), 
-    date_min = "2017-01-01",
-    date_max = "2017-12-31")  |> 
-  mutate(
-    name = recode(id, USW00094728 = "CentralPark_NY"),
-    tmin = tmin / 10,
-    tmax = tmax / 10)  |> 
-  select(name, id, everything())
+homicide_data = read_csv("data/homicide-data.csv") |>
+  janitor::clean_names() |> 
+  mutate(city_state = paste(city, state, sep = ", "),
+         resolved = ifelse(disposition == "Closed by arrest", 1, 0),
+         victim_race = str_to_lower(victim_race),
+         victim_age_clean = as.numeric(gsub("[^0-9]", "", victim_age))) |> 
+  filter(
+    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"),
+    victim_race %in% c("white", "black")
+  ) |> 
+  mutate(victim_age = victim_age_clean) |> 
+  select(-victim_age_clean)  
 ```
 
-## Bootstrap procedure with `modelr::bootstrap`.
+## Run Logistic Regression Analysis for Solving Homicides in Baltimore, MD
 ```{r}
-boot_results = weather_df  |> 
-  modelr::bootstrap(n = 5000)  |> 
-  mutate(
-    model = map(strap, \(df) lm(tmax ~ tmin, data = df)),  
-    glance_results = map(model, broom::glance),           
-    tidy_results = map(model, broom::tidy)                
+baltimore_data = homicide_data |> 
+  filter(city_state == "Baltimore, MD")
+
+baltimore_model = glm(resolved ~ victim_age + victim_sex + victim_race, 
+                       data = baltimore_data, family = binomial())
+
+baltimore_results = broom::tidy(baltimore_model, conf.int = TRUE, exponentiate = TRUE)
+
+baltimore_or = baltimore_results |> 
+  filter(term == "victim_sexMale") |> 
+  select(term, estimate, conf.low, conf.high) |> 
+  rename(
+    `Comparison` = term,
+    `Adjusted Odds Ratio` = estimate,
+    `Lower 95% CI` = conf.low,
+    `Upper 95% CI` = conf.high
   )
 
-
-final_results = boot_results |> 
-  mutate(
-    r_squared = map_dbl(glance_results, "r.squared"),  
-    tidy_df = map(tidy_results, \(df) df |> 
-                    select(term, estimate) |>         
-                    pivot_wider(names_from = term, values_from = estimate) |> 
-                    mutate(log_beta = log(`(Intercept)`) + log(tmin))) 
-  ) |> 
-  select(-strap, -model, -glance_results, -tidy_results) |> 
-  unnest(tidy_df)  
+baltimore_or |> 
+  knitr::kable(caption = "Adjusted Odds Ratio for Male vs Female Victims (Baltimore)") 
 ```
 
-## Draw the Distribution Plots for the estimates $\hat{r}^2$ and $log(\hat{\beta}_0 * \hat{\beta}_1)$.
+## Estimation and Presentation of Adjusted Odds Ratios for Male vs Female Victims by City
 ```{r}
-plot_1 = ggplot(final_results, aes(x = r_squared)) +
-  geom_density(fill = "blue", alpha = 0.5) +
-  labs(title = "Distribution of R_squared", x = "R^2", y = "Density") +
-  theme_minimal()
+city_results = homicide_data |> 
+  group_by(city) |> 
+  nest() |> 
+  mutate(
+    models = map(data, \(df) glm(resolved ~ victim_age + victim_sex + victim_race, 
+                             data = df, family = binomial())),
+    tidy_results = map(models, \(model) broom::tidy(model, conf.int = TRUE, exponentiate = TRUE))
+  ) |> 
+  unnest(tidy_results) |> 
+  filter(term == "victim_sexMale") |> 
+  select(city, estimate, conf.low, conf.high) 
 
-plot_2 = ggplot(final_results, aes(x = log_beta)) +
-  geom_density(fill = "red", alpha = 0.5) +
-  labs(title = "Distribution of log(β0 * β1)", x = "log(β0 * β1)", y = "Density") +
-  theme_minimal()
+city_results |> 
+  knitr::kable(
+    col.names = c(
+      "City", 
+      "Adjusted Odds Ratio", 
+      "Lower 95% CI", 
+      "Upper 95% CI"
+    ),
+    caption = "Adjusted Odds Ratio for Male vs Female Victims by City"
+  )
+```
 
-plot_1 + plot_2
+## Visualization of Estimated Odds Ratios and Confidence Intervals by City
+```{r}
+city_results |> 
+  ggplot(aes(y = reorder(city, estimate), x = estimate)) + 
+    geom_point(color = "blue") +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.25) +  
+    labs(
+      title = "Adjusted Odds Ratios for Solving Homicides (Male vs Female Victims)",
+      x = "Adjusted Odds Ratio (95% CI)",
+      y = "City"
+    )
 ```
 
 **Description**:
 
-Based on the plots, it is evident that both estimates approximate a normal distribution. The left-hand plot illustrates the distribution of \( \hat{r}^2 \), which is primarily concentrated within the range of 0.88 to 0.94 and exhibits a symmetric, unimodal pattern. Similarly, the right-hand plot displays the distribution of \( \log(\hat{\beta}_0 \cdot \hat{\beta}_1) \), concentrated between 1.95 and 2.10, also showing a symmetric, unimodal shape. These patterns indicate that the estimates are precise and consistent.
+1. **Cities with OR < 1:**  
+Male victims are less likely to have their cases resolved in cities where the odds ratio (OR) is below 1. Notable examples include New York and Baton Rouge, which appear near the lower end of the plot.  
 
-To determine the 95% confidence intervals for \( \hat{r}^2 \) and \( \log(\hat{\beta}_0 \cdot \hat{\beta}_1) \), use the 2.5th and 97.5th percentiles derived from the 5000 bootstrap samples.
+2. **Cities with OR > 1:**  
+A limited number of cities, such as Albuquerque and Stockton, exhibit ORs greater than 1. This indicates that male victims in these cities may have a higher likelihood of their cases being resolved compared to female victims. However, the wide confidence intervals (CIs) associated with these ORs highlight significant uncertainty in the estimates.  
 
-```{r}
-ci_results = final_results |> 
-  reframe(
-    r_squared_ci = quantile(r_squared, c(0.025, 0.975)),
-    log_beta_ci = quantile(log_beta, c(0.025, 0.975))
-  )
+3. **Cities with Wide CIs:**  
+Cities like Albuquerque, NM, and Stockton, CA, display notably wide confidence intervals, which reflect either high variability or insufficient data in these locations. Such uncertainty makes it challenging to draw definitive conclusions about the ORs in these cities.  
 
-cat("95% Confidence Interval for R^2:", ci_results$r_squared_ci, "\n")
-cat("95% Confidence Interval for log(beta0 * beta1):", ci_results$log_beta_ci, "\n")
-```
-95% confidence interval for r^2 is (0.894, 0.927).
-95% confidence interval for log (β0⋅β1) is (1.965, 2.059).
-
+4. **Statistical Significance:**  
+Cities where the confidence intervals do not include OR = 1 demonstrate statistically significant differences (e.g., New York). Conversely, cities with confidence intervals that overlap OR = 1 are not statistically significant, indicating no definitive evidence of a difference in resolution rates between male and female victims.  
