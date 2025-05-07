@@ -1,0 +1,840 @@
+---
+title: "final"
+author: "JZ3900"
+output:
+    pdf_document:
+      latex_engine: xelatex
+      fig_caption: yes
+      number_sections: yes
+      toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+
+
+library(knitr)
+library(scales)
+library(janitor)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+library(DescTools)
+library(brms)
+library(rstan)
+library(MCMCpack)
+library(mcmc)
+library(bayesplot)
+library(posterior)
+library(tidyverse)
+```
+
+# Data Acquisition and Preprocessing
+
+```{r read_data}
+diabetes_data <- read_csv("diabetic_data_2.csv",show_col_types = FALSE) |>
+  janitor::clean_names()
+```
+
+We analyzed the *Diabetes 130-US hospitals* dataset obtained from the [UCI Machine Learning Repository](https://archive.ics.uci.edu/dataset/296). Based on documentation from the dataset source, we identified seven variables with missing values encoded using `"?"` instead of standard `NA`. These variables include: `race`, `weight`, `payer_code`, `medical_specialty`, `diag_1`, `diag_2`, and `diag_3`.
+
+To ensure consistent missing value handling, we replaced all `"?"` values with `NA`. A summary of missingness is provided in Table 1. Notably, `weight` had a missing rate of 96.8%, followed by `medical_specialty` (49.0%) and `payer_code` (39.6%). Given the high proportion of missingness and limited predictive utility of these variables, we excluded them from further analyses to enhance computational efficiency and reduce bias. These decisions align with previous practices reported in Strack et al. (2014) [doi:10.1155/2014/781670](https://doi.org/10.1155/2014/781670).
+
+After variable-level filtering, we confirmed that no individual observations (rows) exceeded a reasonable threshold of missing data (e.g., more than 50%). Therefore, no rows were removed at this stage.
+
+Furthermore, the original `readmitted` variable, which had three categories (`"<30"`, `">30"`, and `"NO"`), was recoded into a binary variable `readmitted_binary` to indicate readmission within 30 days. Specifically, we assigned:
+
+- `"<30"` → 1 (positive class)  
+- `">30"` or `"NO"` → 0 (negative class)
+
+This binary classification yielded a positive readmission rate of 11.2% (11,357 out of 101,766 records), which was used as the outcome variable in subsequent modeling.
+
+```{r missing_data}
+missing_cols <- c(
+  "race", "weight", 
+  "payer_code", "medical_specialty", 
+  "diag_1", "diag_2", "diag_3"
+  )
+
+fake_na_vals <- c("?")
+
+diabetes_data <- diabetes_data |> 
+  mutate(
+    across(
+      all_of(missing_cols), 
+      ~ ifelse(.x %in% fake_na_vals, NA, .x)
+      )
+    )
+
+missing_counts <- diabetes_data |> 
+  summarise(
+    across(all_of(missing_cols), ~ sum(is.na(.)))
+  )
+
+missing_summary <- missing_counts |> 
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing_count"
+  ) |> 
+  mutate(
+    missing_rate = missing_count / nrow(diabetes_data),
+    missing_rate_percent = percent(missing_rate, accuracy = 0.2)
+  ) |>
+  dplyr::select(variable, missing_count, missing_rate_percent) |> 
+  rename(
+    `Feature Name` = variable,
+    `Count` = missing_count,
+    `Percent` = missing_rate_percent
+  )
+
+kable(
+  missing_summary |> 
+    dplyr::select(`Feature Name`, `Count`, `Percent`),
+  caption = "Missing value summary"
+)
+
+diabetes_data <- diabetes_data |>
+  dplyr::select(-c("weight", "payer_code", "medical_specialty"))
+```
+
+Following the exclusion of three variables with high proportions of missing data (`weight`, `payer_code`, and `medical_specialty`), we evaluated the completeness of the remaining dataset. The vast majority of the retained variables were either fully observed or exhibited only minimal missingness. Importantly, no individual observations (rows) exceeded a reasonable missing data threshold (e.g., more than 50%). As a result, no rows were removed at this stage based on row-level missingness. However, for the Metropolis-Hastings (MH) algorithm implementation—which does not support missing values—rows with any missing data in the selected variables were subsequently removed.
+
+```{r data_process}
+diabetes_data <- diabetes_data |> 
+  mutate(
+    readmitted_binary = case_when(
+      readmitted == "<30" ~ 1,
+      readmitted %in% c(">30", "NO") ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+diabetes_data |> 
+  count(readmitted, readmitted_binary) |> 
+  mutate(
+    Percent = percent(n / sum(n), accuracy = 0.1)
+  ) |> 
+  kable(
+    caption = "Mapping of Original Readmission Categories to Binary (with Percent)"
+  )
+
+diabetes_data <- diabetes_data |>
+  dplyr::select(-c("readmitted"))
+```
+
+To facilitate binary classification modeling, we recoded the original `readmitted` variable into a binary outcome. The original variable consisted of three categories: `"NO"` (no readmission), `">30"` (readmitted after 30 days), and `"<30"` (readmitted within 30 days). For the purpose of identifying short-term readmissions, we defined a new binary indicator variable, `readmitted_binary`, assigning a value of 1 to `"<30"` and 0 to both `">30"` and `"NO"`. This transformation yielded a positive readmission rate of 11.2%, which served as the outcome variable in subsequent predictive modeling.
+
+# Exploratory Data Analysis
+
+## Key variables
+
+```{r}
+variable_summary <- tribble(
+  ~Category, ~Variable, ~Description,
+  "Administrative", "encounter_id", "Unique ID for each hospital encounter",
+  "", "patient_nbr", "Unique ID for each patient",
+  "", "admission_type_id", "Type of admission (e.g., emergency, urgent)",
+  "", "discharge_disposition_id", "Discharge category (e.g., home, expired)",
+  "", "admission_source_id", "Source of admission (e.g., ER, referral)",
+  
+  "Demographic", "race", "Race of the patient",
+  "", "gender", "Gender of the patient",
+  "", "age", "Age group (e.g., [60-70))",
+  
+  "Hospital-level", "hospital_id", "Hospital identifier (random intercept)",
+  
+  "Utilization", "time_in_hospital", "Length of stay (days)",
+  "", "num_lab_procedures", "Number of lab procedures",
+  "", "num_procedures", "Number of non-lab procedures",
+  "", "num_medications", "Number of unique medications",
+  "", "number_outpatient", "Number of outpatient visits",
+  "", "number_emergency", "Number of emergency visits",
+  "", "number_inpatient", "Number of inpatient visits",
+  
+  "Clinical", "number_diagnoses", "Number of diagnoses recorded",
+  "", "diag_1", "Primary diagnosis (ICD-9 code)",
+  "", "diag_2", "Secondary diagnosis (ICD-9 code)",
+  "", "diag_3", "Tertiary diagnosis (ICD-9 code)",
+  
+  "Lab Result", "max_glu_serum", "Maximum glucose serum test result",
+  "", "A1Cresult", "HbA1c test result",
+  
+  "Medication", "metformin", "Use of metformin",
+  "", "repaglinide", "Use of repaglinide",
+  "", "nateglinide", "Use of nateglinide",
+  "", "chlorpropamide", "Use of chlorpropamide",
+  "", "glimepiride", "Use of glimepiride",
+  "", "acetohexamide", "Use of acetohexamide",
+  "", "glipizide", "Use of glipizide",
+  "", "glyburide", "Use of glyburide",
+  "", "tolbutamide", "Use of tolbutamide",
+  "", "pioglitazone", "Use of pioglitazone",
+  "", "rosiglitazone", "Use of rosiglitazone",
+  "", "acarbose", "Use of acarbose",
+  "", "miglitol", "Use of miglitol",
+  "", "troglitazone", "Use of troglitazone",
+  "", "tolazamide", "Use of tolazamide",
+  "", "examide", "Use of examide",
+  "", "citoglipton", "Use of citoglipton",
+  "", "insulin", "Use of insulin",
+  "", "glyburide_metformin", "Glyburide & metformin combo",
+  "", "glipizide_metformin", "Glipizide & metformin combo",
+  "", "glimepiride_pioglitazone", "Glimepiride & pioglitazone combo",
+  "", "metformin_rosiglitazone", "Metformin & rosiglitazone combo",
+  "", "metformin_pioglitazone", "Metformin & pioglitazone combo",
+  "", "change", "Change in diabetes medication",
+  "", "diabetes_med", "Whether diabetes med is prescribed",
+  
+  "Outcome", "readmitted_binary", "Readmission within 30 days (binary)"
+)
+
+kable(variable_summary, caption = "Summary of Variables: Categories and Descriptions")
+```
+
+```{r var_select_and_convert}
+selected_vars <- c(
+  "readmitted_binary",   # outcome
+  "age", "gender", "race",
+  "number_diagnoses", "diag_1",
+  "time_in_hospital", "number_inpatient", 
+  "number_outpatient", "number_emergency",
+  "a1cresult", "diabetes_med", "change",
+  "admission_type_id", "discharge_disposition_id", "admission_source_id", "insulin",
+  "hospital_id"          # random intercept
+)
+
+diabetes_data_cleaned <- diabetes_data |> 
+  dplyr::select(all_of(selected_vars))
+
+# Function to categorize ICD-9 codes into disease groups
+categorize_diag <- function(code) {
+  code <- suppressWarnings(as.numeric(code))
+  case_when(
+    between(code, 390, 459) | code == 785 ~ "Circulatory",
+    between(code, 460, 519) | code == 786 ~ "Respiratory",
+    between(code, 520, 579) | code == 787 ~ "Digestive",
+    floor(code) == 250                    ~ "Diabetes",
+    between(code, 800, 999)              ~ "Injury",
+    between(code, 710, 739)              ~ "Musculoskeletal",
+    between(code, 580, 629) | code == 788 ~ "Genitourinary",
+    between(code, 140, 239)              ~ "Neoplasms",
+    between(code, 1, 139)                ~ "Infectious",
+    TRUE                                 ~ "Other"
+  )
+}
+
+# Apply diagnosis grouping and convert variable types
+diabetes_data_cleaned <- diabetes_data_cleaned |> 
+  mutate(
+    diag_1_group = categorize_diag(diag_1),
+
+    # Convert to factor variables
+    age = factor(age, ordered = TRUE),
+    gender = factor(gender),
+    race = factor(race),
+    a1cresult = factor(a1cresult),
+    diabetes_med = factor(diabetes_med),
+    change = factor(change),
+    diag_1_group = factor(diag_1_group),
+    hospital_id = factor(hospital_id),
+    admission_type_id = factor(admission_type_id),
+    discharge_disposition_id = factor(discharge_disposition_id),
+    admission_source_id = factor(admission_source_id),
+    insulin = factor(insulin)
+  )
+```
+
+```{r cat_cor}
+categorical_vars <- c(
+  "gender", "race", "age", "a1cresult", "diabetes_med", "change", "diag_1_group", "admission_type_id", "discharge_disposition_id", "admission_source_id", "insulin"
+  )
+
+cat_data <- diabetes_data_cleaned |>
+  dplyr::select(all_of(categorical_vars))
+
+var_names <- colnames(cat_data)
+n <- length(var_names)
+
+cramer_matrix <- matrix(NA, n, n, dimnames = list(var_names, var_names))
+
+for (i in 1:n) {
+  for (j in 1:n) {
+    tbl <- table(cat_data[[i]], cat_data[[j]])
+    cramer_matrix[i, j] <- CramerV(tbl)
+  }
+}
+
+heatmap(cramer_matrix, symm = TRUE, main = "Cramer's V Heatmap of Categorical Variables")
+
+# Update
+diabetes_data_cleaned <- diabetes_data_cleaned |>
+  dplyr::select(-c(diabetes_med, insulin))
+categorical_vars <- c(
+  "gender", "race", "age", 
+  "a1cresult","diag_1_group",  "change", 
+  "admission_type_id", "discharge_disposition_id", "admission_source_id"
+  )
+```
+
+Cramér’s V analysis revealed strong associations among `diabetes_med`, `insulin`, and `change`, all of which relate to diabetes treatment. To reduce redundancy and improve model interpretability, we retained only `change`, which captures whether a medication adjustment occurred during the hospital stay. 
+
+```{r cat_tables}
+# Gender
+gender_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(gender)) |>
+  group_by(Level = gender) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(gender_tbl, caption = "Readmission Rate by Gender")
+
+
+# Race
+race_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(race)) |>
+  group_by(Level = race) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(race_tbl, caption = "Readmission Rate by Race")
+
+
+# Age
+age_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(age)) |>
+  group_by(Level = age) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(age_tbl, caption = "Readmission Rate by Age")
+
+
+# A1C Result
+a1c_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(a1cresult)) |>
+  group_by(Level = a1cresult) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(a1c_tbl, caption = "Readmission Rate by A1C Result")
+
+
+# Change
+change_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(change)) |>
+  group_by(Level = change) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(change_tbl, caption = "Readmission Rate by Change in Medication")
+
+
+# Diagnosis Group
+diag_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(diag_1_group)) |>
+  group_by(Level = diag_1_group) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(diag_tbl, caption = "Readmission Rate by Diagnosis Group")
+
+
+# Admission Type ID
+admission_type_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(admission_type_id)) |>
+  group_by(Level = admission_type_id) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(admission_type_tbl, caption = "Readmission Rate by Admission Type")
+
+
+# Discharge Disposition ID
+discharge_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(discharge_disposition_id)) |>
+  group_by(Level = discharge_disposition_id) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(discharge_tbl, caption = "Readmission Rate by Discharge Disposition")
+
+
+# Admission Source ID
+admission_source_tbl <- diabetes_data_cleaned |>
+  filter(!is.na(admission_source_id)) |>
+  group_by(Level = admission_source_id) |>
+  summarise(
+    N = n(),
+    `Readmitted Rate` = percent(mean(readmitted_binary, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  )
+kable(admission_source_tbl, caption = "Readmission Rate by Admission Source")
+```
+
+```{r cat_bars}
+# Gender
+pc1 <- ggplot(diabetes_data_cleaned, aes(x = gender, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Gender", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Race
+pc2 <- ggplot(diabetes_data_cleaned, aes(x = race, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Race", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Age
+pc3 <- ggplot(diabetes_data_cleaned, aes(x = age, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Age", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# A1C Result
+pc4 <- ggplot(diabetes_data_cleaned, aes(x = a1cresult, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "A1C Result", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Change
+pc5 <- ggplot(diabetes_data_cleaned, aes(x = change, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Change in Medication", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Diagnosis Group
+pc6 <- ggplot(diabetes_data_cleaned, aes(x = diag_1_group, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Diagnosis Group", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Admission Type
+pc7 <- ggplot(diabetes_data_cleaned, aes(x = admission_type_id, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Admission Type", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Discharge Disposition
+pc8 <- ggplot(diabetes_data_cleaned, aes(x = discharge_disposition_id, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Discharge Disposition", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Admission Source
+pc9 <- ggplot(diabetes_data_cleaned, aes(x = admission_source_id, fill = factor(readmitted_binary))) +
+  geom_bar(position = "stack") +
+  labs(title = "Admission Source", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("gray90", "tomato"), name = "Readmitted", labels = c("No", "Yes")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+grid.arrange(pc1, pc2, pc3, ncol = 1)
+grid.arrange(pc4, pc5, pc6, ncol = 1)
+grid.arrange(pc7, pc8, pc9, ncol = 1)
+```
+
+```{r num_hist}
+numeric_vars <- diabetes_data_cleaned |>
+  dplyr::select(number_diagnoses, time_in_hospital, 
+                number_inpatient, number_outpatient, number_emergency)
+
+# number_diagnoses
+pn1 <- ggplot(diabetes_data_cleaned, aes(x = number_diagnoses)) +
+  geom_histogram(binwidth = 1, fill = "tomato", color = "white") +
+  labs(title = "Number of Diagnoses", x = "Number of Diagnoses", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# time_in_hospital
+pn2 <- ggplot(diabetes_data_cleaned, aes(x = time_in_hospital)) +
+  geom_histogram(binwidth = 1, fill = "tomato", color = "white") +
+  labs(title = "Time in Hospital", x = "Days", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# number_inpatient
+pn3 <- ggplot(diabetes_data_cleaned, aes(x = number_inpatient)) +
+  geom_histogram(binwidth = 1, fill = "tomato", color = "white") +
+  labs(title = "Inpatient Visits", x = "Number of Inpatient Visits", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# number_outpatient
+pn4 <- ggplot(diabetes_data_cleaned, aes(x = number_outpatient)) +
+  geom_histogram(binwidth = 1, fill = "tomato", color = "white") +
+  labs(title = "Outpatient Visits", x = "Number of Outpatient Visits", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# number_emergency
+pn5 <- ggplot(diabetes_data_cleaned, aes(x = number_emergency)) +
+  geom_histogram(binwidth = 1, fill = "tomato", color = "white") +
+  labs(title = "Emergency Visits", x = "Number of Emergency Visits", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(pn1, pn2, pn3, pn4, pn5, ncol = 3)
+```
+
+```{r num_corr}
+# Compute and visualize Pearson correlation matrix
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         number.cex = 0.7, title = "Correlation Matrix of Numeric Variables", mar = c(0,0,1,0))
+```
+
+The final set of selected key variables includes: `race`, `gender`, `age`, `admission_type_id`, `discharge_disposition_id`, `admission_source_id`, `hospital_id`, `time_in_hospital`, `number_inpatient`, `number_outpatient`, `number_emergency`, `number_diagnoses`, `A1Cresult`, `diag_1_group`, and `change`.
+
+The outcome variable used in the model is `readmitted_binary`.
+
+# Model Fitting and MCMC Implementation
+
+## Data Preprocessing
+
+To prepare the data for Bayesian hierarchical logistic regression, we applied several preprocessing steps. Count variables such as the number of inpatient, outpatient, and emergency visits were log-transformed using log1p to reduce skewness and stabilize variance. Continuous variables including time in hospital, number of diagnoses, and the log-transformed visit counts were standardized (centered and scaled) to facilitate model convergence and interpretability. Additionally, categorical variables such as race, gender, admission type, discharge disposition, and hospital ID were converted to factor variables to ensure they are appropriately handled as categorical predictors in the model.
+
+```{r}
+diabetes_data_model <- diabetes_data_cleaned |>
+  mutate(
+    across(
+      c(number_inpatient, number_outpatient, number_emergency),
+      ~ log1p(.x),
+      .names = "log_{.col}"
+    ),
+    across(
+      c(time_in_hospital, number_diagnoses, log_number_inpatient, 
+        log_number_outpatient, log_number_emergency),
+      ~ scale(.x)[, 1]
+    ),
+    across(
+      c(race, gender, age, admission_type_id, discharge_disposition_id,
+        admission_source_id, a1cresult, diag_1_group, change, hospital_id),
+      ~ factor(.x)
+    )
+  )
+```
+
+## Bayesian Hierarchical Logistic Regression model using HMH algorithm
+
+We specified a Bayesian Hierarchical Logistic Regression model to predict 30-day readmission among diabetic patients. The response variable `readmitted_binary` was regressed on a comprehensive set of **patient-level predictors**, including demographic variables (race, gender, age), clinical indicators (A1C result, number of diagnoses, time in hospital), and visit characteristics (admission type, discharge disposition, and visit counts). The full list of variables used in the model is provided in the *Final Selected Variables* section. 
+
+To account for clustering within hospitals, we included a random intercept for `hospital_id`, thereby capturing hospital-level variation in baseline readmission risk. 
+The model was implemented using the `brms` package with the `cmdstanr` backend, which employs the **Hamiltonian Monte Carlo (HMC)** algorithm, a more efficient variant of MCMC often referred to as **HMH (Hamiltonian Monte Carlo with the No-U-Turn Sampler)**.
+
+The model was trained using 4 parallel MCMC chains, each with 1,000 iterations and a 500-iteration warm-up period. To enhance sampling stability and reduce divergent transitions, we set `adapt_delta = 0.95`. The model incorporated the specified prior distributions and estimated both fixed effects for patient-level predictors and a random intercept for `hospital_id` to account for hospital-level variation.
+
+Bayesian Hierarchical Logistic Regression Model:
+
+$$
+\begin{aligned}
+&\text{Let } Y_{ij} \sim \text{Bernoulli}(\pi_{ij}), \\
+&\text{with } \text{logit}(\pi_{ij}) = \beta_0 + \sum_{k=1}^p \beta_k X_{ijk} + u_{j}, \\
+&u_j \sim \mathcal{N}(0, \sigma^2), \\
+&\beta_k \sim \mathcal{N}(0, 2^2), \quad \beta_0 \sim t_3(0, 2.5), \quad \sigma \sim t_3(0, 2.5),
+\end{aligned}
+$$
+
+- $i$ indexes patients, and $j$ indexes hospitals;
+
+- $Y_{ij}$ is the binary outcome indicating whether patient $i$ in hospital $j$ was readmitted within 30 days;
+
+- $X_{ijk}$ represents the $k$-th patient-level predictor for patient $i$ in hospital $j$;
+
+- $u_j$ denotes the random intercept for hospital $j$;
+
+- $\beta_k$ are the regression coefficients for the fixed effects.
+
+We used the following priors:
+
+- **Fixed Effects** (`class = "b"`): We used a weakly informative **Normal(0, 2)** prior for all fixed-effect coefficients. This choice provides sufficient flexibility for estimating covariate effects while preventing implausibly large coefficient values
+
+- **Intercept** (`class = "Intercept"`): A **Student-t(3, 0, 2.5)** prior was specified for the intercept, following standard practice in logistic regression to center the baseline log-odds and apply mild regularization.
+
+- **Variance Components** (`class = "sd"`): For the standard deviation of the hospital-level random intercepts, we used a **Student-t(3, 0, 2.5)** prior. This reflects moderate prior uncertainty while ensuring stability and regularization in estimating between-hospital variability.
+
+? These priors are widely recommended defaults in Bayesian hierarchical models, particularly in health outcomes research (Gelman et al., 2008), and ensure computational stability under Hamiltonian Monte Carlo. 
+
+```{r bayes_hier}
+options(
+  brms.backend = "cmdstanr",
+  mc.cores = parallel::detectCores()
+)
+
+# Formula
+formula_bayes <- bf(
+  readmitted_binary ~ race + gender + age + admission_type_id +
+    discharge_disposition_id + admission_source_id + a1cresult +
+    diag_1_group + change +
+    time_in_hospital + number_diagnoses +
+    log_number_inpatient + log_number_outpatient + log_number_emergency +
+    (1 | hospital_id),
+  family = bernoulli()
+)
+
+# Prior distribution
+priors_bayes <- c(
+  prior(normal(0, 2), class = "b"),
+  prior(student_t(3, 0, 2.5), class = "Intercept"),
+  prior(student_t(3, 0, 2.5), class = "sd")
+)
+
+# fit model
+time_hmh <- system.time({
+  fit_bayes <- brm(
+    formula = formula_bayes,
+    data = diabetes_data_model,
+    family = bernoulli(),
+    prior = priors_bayes,
+    chains = 4,
+    iter = 1000,
+    warmup = 500,
+    seed = 2025,
+    control = list(adapt_delta = 0.95)
+  )
+})
+```
+
+## MH Algorithms
+
+```{r mh_algo}
+# MH data (drop na)
+dat_mh <- diabetes_data_model |>
+  drop_na(race, gender, age, admission_type_id,
+          discharge_disposition_id, admission_source_id, a1cresult,
+          diag_1_group, change, time_in_hospital, number_diagnoses,
+          log_number_inpatient, log_number_outpatient, log_number_emergency,
+          readmitted_binary)
+
+# model matrix(exclude hospital_id)
+X_full <- model.matrix(~ race + gender + age + admission_type_id +
+                         discharge_disposition_id + admission_source_id + a1cresult +
+                         diag_1_group + change + time_in_hospital + number_diagnoses +
+                         log_number_inpatient + log_number_outpatient + log_number_emergency,
+                       data = dat_mh)
+
+# Response variable
+y_full <- dat_mh$readmitted_binary
+
+start_full <- rep(0, ncol(X_full))
+# log-posterior：log-likelihood + log-prior
+log_post_full <- function(beta, X, y) {
+  eta <- X %*% beta
+  loglik <- sum(y * eta - log1p(exp(eta)))  # numerically stable log(1 + exp(eta))
+  logprior <- sum(dnorm(beta, mean = 0, sd = 5, log = TRUE))  # same prior as in HMH
+  return(loglik + logprior)
+}
+
+# Metropolis-Hastings
+set.seed(2025)
+time_mh <- system.time({
+  mh_fit_full <- metrop(
+    obj = log_post_full,
+    initial = start_full,
+    nbatch = 1000,
+    blen = 1,
+    scale = 0.01,
+    X = X_full,
+    y = y_full
+  )
+})
+
+# Trace plot for selected coefficient (e.g., Intercept)
+plot(mh_fit_full$batch[, 1], type = "l",
+     main = "MH Trace for Intercept (Full Model)",
+     ylab = "Value", xlab = "Iteration")
+```
+
+## Compare
+
+### Convergence Diagnostics
+
+#### HMH
+
+```{r hmh_trace}
+posterior_draws <- as_draws_df(fit_bayes)
+param_names <- posterior_draws |> 
+  dplyr::select(-.chain, -.iteration, -.draw) |> 
+  colnames() |> 
+  head(16)
+
+# trace plot
+make_trace <- function(param) {
+  ggplot(posterior_draws, aes(x = .draw, y = .data[[param]])) +
+    geom_line(alpha = 0.6) +
+    labs(title = paste("Trace of", param), x = "Iteration", y = "") +
+    theme_minimal(base_size = 9)
+}
+
+plot_list <- lapply(param_names, make_trace)
+grid.arrange(grobs = plot_list, ncol = 4)
+```
+
+```{r}
+summary(fit_bayes)$fixed  # for fixed effects
+summary(fit_bayes)$random # for random effects
+
+# OR extract with posterior package
+posterior_summary <- summarise_draws(as_draws(fit_bayes), default_convergence_measures())
+print(posterior_summary)
+```
+
+We evaluated convergence of the Bayesian hierarchical logistic regression model fitted using Hamiltonian Monte Carlo (HMH) through a combination of visual and quantitative diagnostics. The trace plots for fixed effect parameters (e.g., `b_Intercept`, `b_raceAsian`, `b_genderMale`, and multiple orthogonal polynomial contrasts of `age`) showed stable behavior with no apparent trends, drifts, or discontinuities across 2000 iterations. This indicates good mixing and stationarity of the chains.
+
+In addition to trace plots, we computed the potential scale reduction factor (R̂) and effective sample sizes (ESS) for all parameters using the `posterior` package. All R̂ values were very close to 1.00, with most between 0.999 and 1.004, indicating convergence across all chains. Bulk ESS values exceeded 1,000 for nearly all parameters, far above the conventional threshold of 400, further supporting that the chains were efficiently sampling from the posterior distribution.
+
+The random intercept for hospitals (`sd(Intercept)`) also demonstrated acceptable convergence. It had an R̂ of 1.003 and a bulk ESS of 788, which, while lower than those of the fixed effects, still satisfies common convergence standards. The posterior mean of 0.199 and relatively narrow 95% credible interval suggest that hospital-level variation was appropriately captured.
+
+Together, these diagnostics confirm that the HMH sampler provided well-converged posterior distributions for both fixed and random effects in the hierarchical model. As a result, downstream inference based on posterior summaries can be considered reliable.
+
+#### MH
+
+```{r mh_trace}
+mh_df <- as.data.frame(mh_fit_full$batch)
+mh_df$iter <- seq_len(nrow(mh_df))
+
+colnames(mh_df)[1:(ncol(mh_df) - 1)] <- paste0("beta", 1:(ncol(mh_df) - 1))
+
+# trace plot
+make_mh_trace <- function(param) {
+  ggplot(mh_df, aes_string(x = "iter", y = param)) +
+    geom_line(alpha = 0.6) +
+    labs(title = paste("Trace plot of", param), x = "Iteration", y = param) +
+    theme_minimal(base_size = 10)
+}
+
+params_mh <- colnames(mh_df)[1:16]
+
+plot_list_mh <- lapply(params_mh, make_mh_trace)
+grid.arrange(grobs = plot_list_mh, ncol = 4)
+```
+
+```{r}
+library(coda)
+
+# Assuming your MH samples are stored in `mh_fit_full$batch`
+mh_chain <- mcmc(mh_fit_full$batch)
+
+# ESS
+effectiveSize(mh_chain)
+```
+
+To evaluate the convergence of the Metropolis-Hastings (MH) algorithm, we first examined trace plots of the sampled parameters. Ideally, these traces should fluctuate around a stable mean, indicating good mixing. However, many parameters (e.g., beta1, beta3, beta7) displayed strong trends, drifts, or poor stationarity, suggesting that the chains did not explore the posterior distribution effectively and may not have reached convergence.
+
+We further assessed convergence using the Effective Sample Size (ESS), computed via the coda package. Most parameters exhibited ESS values far below the commonly accepted threshold of 200, with many falling under 10 and some even below 2. Such low ESS values indicate severe autocorrelation and inefficient sampling, confirming that the chain provides limited independent information.
+
+Taken together, the trace plot patterns and ESS results suggest that **the MH algorithm has not converged**. The high autocorrelation and poor mixing imply that the posterior estimates derived from this sampler may be unreliable.
+
+### Compute Time
+
+```{r}
+computing_time_tbl <- tibble::tibble(
+  Algorithm = c("Hamiltonian Monte Carlo (HMH)", "Metropolis-Hastings (MH)"),
+  User_Time_sec = c(time_hmh["user.self"], time_mh["user.self"]),
+  System_Time_sec = c(time_hmh["sys.self"], time_mh["sys.self"]),
+  Elapsed_Time_sec = c(time_hmh["elapsed"], time_mh["elapsed"])
+)
+
+knitr::kable(computing_time_tbl, caption = "Computing Time Comparison: HMH vs MH")
+```
+
+HMH took over 2800 seconds of elapsed time versus just 18 seconds for MH. This dramatic increase in runtime highlights the trade-off between sampling efficiency and computational expense. Despite the cost, HMH is preferable in this case due to its superior convergence properties, making it more reliable for inference in complex hierarchical models.
+
+# Posterior Inference and Model evaluatin
+
+## Fixed Effects
+
+```{r}
+fixed_summary <- summary(fit_bayes)$fixed
+print(fixed_summary)
+```
+
+```{r}
+# 95% CI excludes 0
+sig_fixed <- fixed_summary %>%
+  filter(`l-95% CI` > 0 | `u-95% CI` < 0)
+
+ggplot(sig_fixed, aes(x = reorder(rownames(sig_fixed), Estimate), y = Estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = `l-95% CI`, ymax = `u-95% CI`), width = 0.2) +
+  coord_flip() +
+  labs(x = "Variable", y = "Posterior Estimate", title = "Significant Fixed Effects (95% CI excludes 0)")
+
+```
+
+We summarized posterior estimates for all fixed effects using the summary(fit_bayes)$fixed output. Key variables with 95% credible intervals excluding 0—such as age (linear and cubic terms), number of prior inpatient visits, time in hospital, number of diagnoses, and treatment change—were significantly associated with 30-day readmission. Additionally, several discharge dispositions and admission-related variables showed strong effects, suggesting important hospital-level influences. A coefficient plot was used to highlight significant predictors. 
+
+## Random Effects
+
+```{r}
+random_summary <- summary(fit_bayes)$random$hospital_id
+print(random_summary)
+```
+
+The posterior summary of the hospital-level random intercept shows an estimated standard deviation of 0.199, with a 95% credible interval ranging from 0.144 to 0.263. Since this interval does not include zero, it provides strong evidence that the baseline risk of readmission varies meaningfully across hospitals. This variation cannot be explained by patient-level covariates alone and suggests that unmeasured hospital-level characteristics, such as differences in discharge planning, follow-up care, or hospital protocols, may influence readmission rates. Therefore, incorporating a random intercept for hospitals is not only statistically justified but also important for capturing the hierarchical structure of the data and improving the model's overall fit and interpretability.
+
+## Model Evaluation
+
+The Bayesian hierarchical logistic regression model was evaluated based on both convergence diagnostics and posterior summaries. All key convergence metrics—such as R-hat values near 1 and effective sample sizes (ESS) exceeding recommended thresholds—indicated successful mixing and convergence of the Hamiltonian Monte Carlo chains. The inclusion of hospital-level random intercepts significantly improved model fit, capturing unobserved heterogeneity across hospitals. Moreover, the identification of multiple fixed effects with high posterior certainty demonstrates the model’s capacity to detect meaningful predictors of 30-day readmission. Together, these results support the model's adequacy for inference and its utility in addressing the hierarchical structure of the data.
+
+# Interpretation and Reporting
+
+## Patient-Level Interpretation
+The model identified several patient-level characteristics significantly associated with 30-day readmission. A higher number of prior inpatient visits (`log_number_inpatient`), longer hospital stays (`time_in_hospital`), and greater diagnostic complexity (`number_diagnoses`) were all linked to increased risk, highlighting the importance of clinical severity and care history. The lack of medication change during the hospital stay (`changeNo`) was also positively associated with readmission, possibly indicating missed treatment opportunities.
+
+Demographic variables showed nuanced effects. Age demonstrated a nonlinear association with readmission risk, as captured by significant polynomial terms, suggesting varying vulnerability across age groups. Some race and gender effects were also observed, though less consistently. These findings provide a clinically interpretable framework for identifying high-risk patients before discharge.
+
+## Hospital-Level Interpretation
+The inclusion of a random intercept for hospitals captured substantial between-hospital variation in baseline readmission risk. The posterior estimate for the standard deviation of the hospital-level intercept indicates that hospital-level factors—such as discharge planning, follow-up protocols, and institutional care quality—play a nontrivial role in patient outcomes. Furthermore, some hospital-related categorical variables, such as `discharge_disposition_id` and `admission_source_id`, showed large and significant effects, reinforcing the importance of systemic care pathways.
+
+## Policy and Clinical Implications
+Together, these findings offer actionable insights. Clinicians can use the identified patient-level risk factors to guide individualized discharge planning, early follow-up appointments, or transitional care interventions. At a policy level, understanding which hospital-level factors contribute most to readmission variation can support quality improvement initiatives, inform hospital benchmarking, and help allocate resources toward institutions serving high-risk populations.
+
+# Reference
+1. https://doi.org/10.1155/2014/781670
+2. https://doi.org/10.1002/jhm.2606
+3. https://doi.org/10.1214/08-AOAS191
+4. https://doi.org/10.1214/08-AOAS191
+
+

@@ -1,0 +1,470 @@
+---
+title: "hospital_readmission_analysis.Rmd"
+author: "java"
+date: "2025-05-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# --- 1. SETUP ---
+library(dplyr)
+library(ggplot2)
+library(coda)
+library(mvtnorm)
+library(stringr)
+library(knitr) # For kable, to print tables nicely
+library(kableExtra) # 添加这一行
+library(psych)      # 用于 describe() 函数
+library(gridExtra)  # 用于图形布局
+library(corrplot)   # 用于相关性可视化
+library(psych)
+library(kableExtra)
+library(rstatix)
+library(reshape2)
+library(kableExtra)
+
+
+
+
+set.seed(123) # For reproducibility
+```
+
+
+
+```{r}
+# --- 2. DATA LOADING AND INITIAL CLEANING ---
+cat("--- Data Loading and Initial Cleaning ---\n")
+tryCatch({
+  data_orig <- read.csv("diabetic_data_2.csv", na.strings = "?", stringsAsFactors = FALSE)
+}, error = function(e) {
+  stop("Failed to load diabetic_data_2.csv. Please ensure it's in your working directory.")
+})
+cat("Original data dimensions:", dim(data_orig)[1], "rows,", dim(data_orig)[2], "columns\n")
+
+data_clean <- data_orig %>%
+  mutate(readmitted_binary = case_when(
+    readmitted == "<30" ~ 1,
+    readmitted == ">30" ~ 0,
+    readmitted == "NO"  ~ 0,
+    TRUE ~ NA_integer_
+  )) %>%
+  filter(!is.na(readmitted_binary))
+cat("Dimensions after outcome recoding & NA removal:", dim(data_clean)[1], "rows,", dim(data_clean)[2], "columns\n")
+
+actual_hospital_id_colname <- "hospital_id" # <<< USER: VERIFY AND CHANGE THIS IF NEEDED
+if (!actual_hospital_id_colname %in% colnames(data_clean)) {
+  stop(paste("The specified hospital ID column '", actual_hospital_id_colname, "' was not found. Please verify."))
+}
+if (actual_hospital_id_colname != "hospital_id") {
+  data_clean <- data_clean %>% rename(hospital_id = all_of(actual_hospital_id_colname))
+}
+data_clean$hospital_id <- as.factor(data_clean$hospital_id)
+n_hospitals_total <- length(levels(data_clean$hospital_id))
+cat("Identified", n_hospitals_total, "unique hospitals from column '", actual_hospital_id_colname, "'.\n")
+
+missing_threshold_col <- 0.50
+na_col_percentages <- colMeans(is.na(data_clean))
+cols_to_remove <- names(na_col_percentages[na_col_percentages > missing_threshold_col])
+if (length(cols_to_remove) > 0) {
+  data_clean <- data_clean %>% select(-all_of(cols_to_remove))
+  cat("Removed", length(cols_to_remove), "columns due to >", missing_threshold_col*100, "% NAs:", paste(cols_to_remove, collapse=", "), "\n")
+} else {
+  cat("No columns removed based on missing value threshold of", missing_threshold_col*100, "%\n")
+}
+cat("Dimensions after column-wise NA filtering:", dim(data_clean)[1], "rows,", dim(data_clean)[2], "columns\n")
+
+potential_predictors_all <- setdiff(colnames(data_clean),
+                                  c("encounter_id", "patient_nbr", "readmitted", "readmitted_binary",
+                                    "diag_1", "diag_2", "diag_3",
+                                    "weight", "payer_code", "medical_specialty", actual_hospital_id_colname))# also exclude original hospital_id if renamed
+
+essential_cols_for_na_check <- c("readmitted_binary", "hospital_id", intersect(potential_predictors_all, colnames(data_clean)))
+rows_before_na_omit <- nrow(data_clean)
+
+# Create a temporary data frame for NA checking on essential columns
+temp_data_for_na_check <- data_clean %>% select(all_of(essential_cols_for_na_check))
+kept_rows_indices <- which(complete.cases(temp_data_for_na_check)) # Get indices of rows with no NAs in essential cols
+data_cleaned_rows <- data_clean[kept_rows_indices, ] # Subset original data_clean
+
+cat("Dimensions after row-wise NA filtering (on essential model columns):", dim(data_cleaned_rows)[1], "rows,", dim(data_cleaned_rows)[2], "columns\n")
+cat(rows_before_na_omit - nrow(data_cleaned_rows), "rows removed due to NAs in essential columns.\n")
+
+if (nrow(data_cleaned_rows) == 0) {
+  stop("No data remaining after NA filtering. Check NA patterns or chosen predictors.")
+}
+```
+
+```{r}
+# --- Selected Variable Types Summary with Serial Number ---
+
+library(kableExtra)
+
+cat("\n--- Summary Table: Selected Variables and Types ---\n")
+
+# 1. 确定变量
+selected_vars <- setdiff(colnames(data_cleaned_rows), 
+                         c("encounter_id", "patient_nbr", "readmitted", 
+                           "diag_1", "diag_2", "diag_3", "readmitted_binary"))
+
+# 2. 初步判断类型
+var_types <- sapply(data_cleaned_rows[, selected_vars], function(x) {
+  if (is.numeric(x)) {
+    return("Numeric")
+  } else if (is.factor(x) || is.character(x)) {
+    return("Categorical")
+  } else {
+    return(class(x))
+  }
+})
+
+# 3. 强制指定部分变量为分类变量
+forced_categorical_vars <- c("admission_type_id", "discharge_disposition_id", "admission_source_id")
+for (var in forced_categorical_vars) {
+  if (var %in% names(var_types)) {
+    var_types[var] <- "Categorical"
+  }
+}
+
+
+# 可选：将强制分类变量转为 factor 类型
+data_cleaned_rows <- data_cleaned_rows %>%
+  mutate(across(all_of(forced_categorical_vars), ~ as.factor(.)))
+
+# 3. 构建表格（添加序号）
+var_summary_table <- data.frame(
+  No. = seq_along(selected_vars),
+  Variable = selected_vars,
+  Type = var_types,
+  Description = rep("To be filled", length(selected_vars))
+)
+
+# 4. 输出三线表
+kable(var_summary_table, format = "html", 
+      caption = "Table 1. Selected Variables and Their Types",
+      align = c("c", "l", "l", "l")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE) %>%
+  column_spec(1, width = "1.5cm") %>%
+  column_spec(2, width = "4cm") %>%
+  column_spec(3, width = "3cm") %>%
+  column_spec(4, width = "7cm")
+
+# --- Descriptive Statistics for Numeric Variables ---
+cat("\n--- Descriptive Statistics for Numeric Variables ---\n")
+
+# 1. 识别数值型变量（排除因变量）
+numeric_vars <- selected_vars[sapply(data_cleaned_rows[, selected_vars], is.numeric)]
+numeric_vars <- setdiff(numeric_vars, c("readmitted_binary"))  # 若有需要，也可保留它
+
+if(length(numeric_vars) > 0){
+  # 2. 使用 psych::describe 生成描述性统计
+  numeric_summary <- describe(data_cleaned_rows[, numeric_vars]) %>%
+    select(n, mean, sd, median, min, max, skew, kurtosis) %>%
+    round(2)
+
+  # 3. 添加变量名称列（rownames → 第一列）
+  numeric_summary <- cbind(Variable = rownames(numeric_summary), numeric_summary)
+  rownames(numeric_summary) <- NULL
+
+  # 4. 三线表输出
+  kable(numeric_summary, format = "html", 
+        caption = "Table 2. Descriptive Statistics for Numeric Variables",
+        align = c("l", rep("c", 8))) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    row_spec(0, bold = TRUE) %>%
+    column_spec(1, width = "4cm")
+} else {
+  cat("No numeric variables available for summary.\n")
+}
+
+# --- Histogram Plots for Numeric Variables (Max 4 per page) ---
+
+library(ggplot2)
+library(gridExtra)
+
+cat("\n--- Histogram Plots for Numeric Variables (Paged, 4 per page) ---\n")
+
+if(length(numeric_vars) > 0){
+
+  # 创建直方图列表
+  hist_plots <- lapply(numeric_vars, function(var) {
+    ggplot(data_cleaned_rows, aes_string(x = var)) +
+      geom_histogram(bins = 30, fill = "#3498DB", color = "white", alpha = 0.9) +
+      theme_minimal() +
+      labs(title = paste("Histogram of", var), x = var, y = "Frequency") +
+      theme(
+        plot.title = element_text(size = 10, face = "bold", hjust = 0.5),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 9)
+      )
+  })
+
+  # 使用 marrangeGrob 分页显示，每页 2x2 图（最多 4 个）
+  multi_pages <- marrangeGrob(grobs = hist_plots, nrow = 2, ncol = 2)
+
+  # 打印所有分页图（自动翻页）
+  print(multi_pages)
+
+} else {
+  cat("No numeric variables to plot.\n")
+}
+
+# --- Collinearity Analysis for Numeric Variables ---
+
+library(corrplot)
+library(kableExtra)
+
+cat("\n--- Collinearity Analysis for Numeric Variables ---\n")
+
+if(length(numeric_vars) > 1){
+
+  # 1. 提取数值型变量数据
+  num_data <- data_cleaned_rows[, numeric_vars]
+
+  # 2. 计算相关系数矩阵（去除缺失）
+  cor_matrix <- cor(num_data, use = "pairwise.complete.obs")
+
+  # 3. 提取高相关变量对（|r| > 0.7）
+  high_corr_idx <- which(abs(cor_matrix) > 0.7 & upper.tri(cor_matrix), arr.ind = TRUE)
+
+  if(nrow(high_corr_idx) > 0){
+    high_corr_pairs <- data.frame(
+      Var1 = rownames(cor_matrix)[high_corr_idx[, 1]],
+      Var2 = colnames(cor_matrix)[high_corr_idx[, 2]],
+      Correlation = round(cor_matrix[high_corr_idx], 3)
+    ) %>% arrange(desc(abs(Correlation)))
+
+    # 4. 输出三线表
+    kable(high_corr_pairs, format = "html", 
+          caption = "Table 3. Highly Correlated Variable Pairs (|r| > 0.7)",
+          align = "llc") %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                    full_width = FALSE, position = "left") %>%
+      row_spec(0, bold = TRUE)
+
+  } else {
+    cat("✅ No highly correlated variable pairs found (|r| > 0.7).\n")
+  }
+
+  # 5. 可视化：相关矩阵热图（仅上三角）
+  corrplot(cor_matrix, method = "color", type = "upper",
+           tl.col = "black", tl.srt = 45,
+           addCoef.col = "black", number.cex = 0.6,
+           mar = c(0, 0, 1, 0),
+           title = "Correlation Matrix of Numeric Variables")
+
+} else {
+  cat("Insufficient numeric variables for collinearity analysis (need at least 2).\n")
+}
+
+# --- Descriptive Statistics for Categorical Variables with Readmission Analysis ---
+
+library(kableExtra)
+
+cat("\n--- Descriptive Statistics for Categorical Variables ---\n")
+
+# 1. 获取分类变量
+categorical_vars <- selected_vars[sapply(data_cleaned_rows[, selected_vars], function(x)
+  is.factor(x) || is.character(x))]
+
+if(length(categorical_vars) > 0){
+
+  # 2. 汇总每个分类变量的类别频数 + 再入院率
+  cat_summary <- lapply(categorical_vars, function(var){
+    data_cleaned_rows %>%
+      group_by(!!sym(var)) %>%
+      summarise(
+        Count = n(),
+        Percent = round(Count / nrow(data_cleaned_rows) * 100, 1),
+        ReadmissionRate = round(mean(readmitted_binary == 1, na.rm = TRUE) * 100, 1)
+      ) %>%
+      rename(Category = 1) %>%
+      mutate(Variable = var) %>%
+      select(Variable, Category, Count, Percent, ReadmissionRate)
+  }) %>% bind_rows()
+
+  # 3. 输出三线表
+  kable(cat_summary, format = "html",
+        caption = "Table 4. Categorical Variables Summary with Readmission Rate (%)",
+        align = c("l", "l", "r", "r", "r")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    row_spec(0, bold = TRUE) %>%
+    scroll_box(height = "500px")
+
+} else {
+  cat("No categorical variables found.\n")
+}
+
+# --- One-Per-Page Stacked Bar Plots for Categorical Variables ---
+
+library(ggplot2)
+library(gridExtra)
+
+cat("\n--- One-Per-Page Stacked Bar Plots for Categorical Variables ---\n")
+
+if (length(categorical_vars) > 0) {
+
+  stack_bar_plots <- lapply(categorical_vars, function(var) {
+    data_cleaned_rows %>%
+      group_by(!!sym(var), readmitted_binary) %>%
+      summarise(Count = n(), .groups = "drop") %>%
+      group_by(!!sym(var)) %>%
+      mutate(Proportion = Count / sum(Count)) %>%
+      ggplot(aes_string(x = var, y = "Proportion", fill = "factor(readmitted_binary)")) +
+      geom_bar(stat = "identity") +
+      scale_fill_manual(values = c("0" = "#3498DB", "1" = "#E74C3C"),
+                        labels = c("No Readmission", "Readmission <30"),
+                        name = "Readmission Status") +
+      labs(title = paste("Readmission by", var), x = var, y = "Proportion") +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 60, hjust = 1, size = 7),
+        axis.title = element_text(size = 9),
+        plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+        legend.position = "bottom"
+      )
+  })
+
+  # 每页只显示一个图
+  paged_plots <- marrangeGrob(grobs = stack_bar_plots, nrow = 1, ncol = 1)
+  print(paged_plots)
+
+} else {
+  cat("No categorical variables to plot.\n")
+}
+
+# --- Categorical Variable Collinearity: Cramér's V Heatmap (ggplot2 version) ---
+
+library(rstatix)
+library(reshape2)
+library(ggplot2)
+
+cat("\n--- Categorical Variable Collinearity Analysis using Cramér's V ---\n")
+
+# 1. 获取所有分类变量（已由你前面定义）
+categorical_vars <- selected_vars[sapply(data_cleaned_rows[, selected_vars], function(x)
+  is.factor(x) || is.character(x))]
+
+if (length(categorical_vars) > 1) {
+
+  n <- length(categorical_vars)
+  cramer_matrix <- matrix(NA, nrow = n, ncol = n)
+  rownames(cramer_matrix) <- colnames(cramer_matrix) <- categorical_vars
+
+  # 2. 计算 Cramér's V 上三角矩阵
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      tbl <- table(data_cleaned_rows[[categorical_vars[i]]],
+                   data_cleaned_rows[[categorical_vars[j]]])
+      if (nrow(tbl) >= 2 && ncol(tbl) >= 2) {
+        cramer_v <- suppressWarnings(rstatix::cramer_v(tbl))
+        cramer_matrix[i, j] <- cramer_v
+      }
+    }
+  }
+
+  # 3. 转换为长表格用于 ggplot2
+  cramer_long <- melt(cramer_matrix, na.rm = TRUE)
+  colnames(cramer_long) <- c("Var1", "Var2", "CramersV")
+
+  # 4. 绘图：Cramér's V 热图
+  ggplot(cramer_long, aes(x = Var2, y = Var1, fill = CramersV)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient(low = "white", high = "#E74C3C", name = "Cramér's V") +
+    geom_text(aes(label = round(CramersV, 2)), size = 2.2) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      axis.text.y = element_text(size = 7),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.major = element_blank(),
+      panel.border = element_blank()
+    ) +
+    labs(title = "Cramér's V Heatmap for Categorical Variables", x = NULL, y = NULL)
+
+} else {
+  cat("Not enough categorical variables for Cramér's V analysis.\n")
+}
+
+# 5. 输出高共线性变量对（Cramér's V > 0.7）
+
+library(dplyr)
+library(kableExtra)
+
+high_cramer_pairs <- cramer_long %>%
+  filter(CramersV > 0.7) %>%
+  arrange(desc(CramersV))
+
+if (nrow(high_cramer_pairs) > 0) {
+  kable(high_cramer_pairs,
+        caption = "Table 6. Highly Associated Categorical Variable Pairs (Cramér's V > 0.7)",
+        digits = 2, format = "html") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    row_spec(0, bold = TRUE)
+} else {
+  cat("\n✅ No categorical variable pairs with Cramér's V > 0.7 found.\n")
+}
+```
+
+```{r bayesian_fast, message=FALSE, warning=FALSE, cache=TRUE}
+# --- Setup ---
+options(
+  brms.backend = "cmdstanr",
+  mc.cores = parallel::detectCores()
+)
+
+# 1. 确定需要设置为因子的变量
+# 假设这些变量是从模型中需要作为因子的变量列表
+vars_to_factor <- c("hospital_id", "admission_type_id", "discharge_disposition_id", 
+                    "admission_source_id", "change")  # 根据需要修改变量名
+
+# 2. 设置这些变量为因子
+data_cleaned_rows <- data_cleaned_rows %>%
+  mutate(across(all_of(vars_to_factor), ~ as.factor(.)))
+
+# 3. 查看结果
+str(data_cleaned_rows)
+
+
+# Formula
+formula_bayes <- bf(
+  readmitted_binary ~ race + gender + age + admission_type_id +
+    discharge_disposition_id +  A1Cresult  +
+    time_in_hospital + number_diagnoses + (1 | hospital_id),
+  family = bernoulli()
+)
+
+# Prior distribution
+priors_bayes <- c(
+  prior(normal(0, 2), class = "b"),
+  prior(student_t(3, 0, 2.5), class = "Intercept"),
+  prior(student_t(3, 0, 2.5), class = "sd")
+)
+
+# Fit model
+time_hmh <- system.time({
+  fit_bayes <- brm(
+    formula = formula_bayes,
+    data = data_cleaned_rows,
+    family = bernoulli(),
+    prior = priors_bayes,
+    chains = 4,
+    iter = 1000,
+    warmup = 500,
+    seed = 2025,
+    control = list(adapt_delta = 0.95)
+  )
+})
+
+
+```
+
+```{r}
+
+
+```
